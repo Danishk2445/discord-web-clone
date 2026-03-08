@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { MessageSquare, Hash, Send, LogOut, Plus, UserPlus, Users, Link as LinkIcon, Check, X, Mail } from 'lucide-react';
+import SockJS from 'sockjs-client';
+import { Client } from '@stomp/stompjs';
 
 const API_BASE = 'http://localhost:8080/api';
 
@@ -95,17 +97,52 @@ function App() {
   const [showMembersList, setShowMembersList] = useState<boolean>(true);
   const [serverMembers, setServerMembers] = useState<ServerMember[]>([]);
 
+  // WebSocket refs
+  const stompClientRef = useRef<Client | null>(null);
+  const channelSubRef = useRef<{ unsubscribe: () => void } | null>(null);
+  const selectedFriendRef = useRef<SelectedFriend | null>(null);
+
+  // Keep selectedFriend ref in sync to avoid stale closures in WS callbacks
+  useEffect(() => { selectedFriendRef.current = selectedFriend; }, [selectedFriend]);
+
+  // Connect WebSocket on login, disconnect on logout
+  useEffect(() => {
+    if (!user) return;
+    const client = new Client({
+      webSocketFactory: () => new SockJS('http://localhost:8080/ws') as unknown as WebSocket,
+      reconnectDelay: 5000,
+      onConnect: () => {
+        // Subscribe to incoming DMs for this user
+        client.subscribe(`/topic/dm.${user.id}`, (msg) => {
+          const dm: DMMessage = JSON.parse(msg.body);
+          const friend = selectedFriendRef.current;
+          if (friend && (dm.senderId === friend.id || dm.receiverId === friend.id)) {
+            setDmMessages(prev =>
+              prev.some((m) => m.id === dm.id) ? prev : [...prev, dm]
+            );
+          }
+        });
+      },
+    });
+    client.activate();
+    stompClientRef.current = client;
+    return () => {
+      client.deactivate();
+      stompClientRef.current = null;
+    };
+  }, [user]);
+
   useEffect(() => {
     if (user) {
       fetchServers();
       fetchFriends();
       fetchPendingRequests();
-      
+
       const friendInterval = setInterval(() => {
         fetchFriends();
         fetchPendingRequests();
       }, 3000);
-      
+
       return () => clearInterval(friendInterval);
     }
   }, [user]);
@@ -118,19 +155,33 @@ function App() {
     }
   }, [selectedServer]);
 
+  // Subscribe to live channel messages via WebSocket; fetch history on channel change
   useEffect(() => {
+    if (channelSubRef.current) {
+      channelSubRef.current.unsubscribe();
+      channelSubRef.current = null;
+    }
     if (selectedChannel && activeView === 'servers') {
       fetchMessages(selectedChannel.id);
-      const interval = setInterval(() => fetchMessages(selectedChannel.id), 3000);
-      return () => clearInterval(interval);
+      const client = stompClientRef.current;
+      if (client?.connected) {
+        channelSubRef.current = client.subscribe(
+          `/topic/channel.${selectedChannel.id}`,
+          (msg) => {
+            const message: Message = JSON.parse(msg.body);
+            setMessages(prev =>
+              prev.some((m) => m.id === message.id) ? prev : [...prev, message]
+            );
+          }
+        );
+      }
     }
   }, [selectedChannel, activeView]);
 
   useEffect(() => {
     if (selectedFriend && activeView === 'dms') {
+      // Fetch history; live DMs arrive via the /topic/dm.{userId} subscription
       fetchDMMessages(selectedFriend.id);
-      const interval = setInterval(() => fetchDMMessages(selectedFriend.id), 3000);
-      return () => clearInterval(interval);
     }
   }, [selectedFriend, activeView]);
 
@@ -159,8 +210,9 @@ function App() {
     if (!user) return;
     try {
       const res = await fetch(`${API_BASE}/servers/user/${user.id}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setServers(data);
+      setServers(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch servers');
     }
@@ -169,8 +221,9 @@ function App() {
   const fetchChannels = async (serverId: number): Promise<void> => {
     try {
       const res = await fetch(`${API_BASE}/channels/server/${serverId}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setChannels(data);
+      setChannels(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch channels');
     }
@@ -179,8 +232,9 @@ function App() {
   const fetchMessages = async (channelId: number): Promise<void> => {
     try {
       const res = await fetch(`${API_BASE}/messages/channel/${channelId}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setMessages(data);
+      setMessages(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch messages');
     }
@@ -190,8 +244,9 @@ function App() {
     if (!user) return;
     try {
       const res = await fetch(`${API_BASE}/friends/user/${user.id}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setFriends(data);
+      setFriends(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch friends');
     }
@@ -201,8 +256,9 @@ function App() {
     if (!user) return;
     try {
       const res = await fetch(`${API_BASE}/friends/requests/${user.id}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setPendingRequests(data);
+      setPendingRequests(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch pending requests');
     }
@@ -211,8 +267,9 @@ function App() {
   const fetchServerMembers = async (serverId: number): Promise<void> => {
     try {
       const res = await fetch(`${API_BASE}/servers/${serverId}/members`);
+      if (!res.ok) return;
       const data = await res.json();
-      setServerMembers(data);
+      setServerMembers(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch server members');
     }
@@ -222,8 +279,9 @@ function App() {
     if (!user) return;
     try {
       const res = await fetch(`${API_BASE}/dm/conversation?userId1=${user.id}&userId2=${friendId}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setDmMessages(data);
+      setDmMessages(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Failed to fetch DM messages');
     }
@@ -351,7 +409,13 @@ function App() {
       });
       if (res.ok) {
         setMessageInput('');
-        fetchMessages(selectedChannel.id);
+        // Optimistic update: add message immediately for the sender
+        // The WS broadcast deduplicates it for all other clients
+        const saved: Message = await res.json();
+        saved.senderUsername = user.username;
+        setMessages(prev =>
+          prev.some((m) => m.id === saved.id) ? prev : [...prev, saved]
+        );
       }
     } catch (err) {
       alert('Failed to send message');
@@ -372,7 +436,12 @@ function App() {
       });
       if (res.ok) {
         setMessageInput('');
-        fetchDMMessages(selectedFriend.id);
+        // Sender sees their own message from REST; receiver gets WS push to /topic/dm.{receiverId}
+        const saved: DMMessage = await res.json();
+        saved.senderUsername = user.username;
+        setDmMessages(prev =>
+          prev.some((m) => m.id === saved.id) ? prev : [...prev, saved]
+        );
       }
     } catch (err) {
       alert('Failed to send DM');
@@ -452,11 +521,10 @@ function App() {
             setSelectedChannel(null);
             setSelectedFriend(null);
           }}
-          className={`w-12 h-12 rounded-full flex items-center justify-center transition ${
-            activeView === 'dms' && !selectedFriend
-              ? 'bg-indigo-600 text-white'
-              : 'bg-gray-700 text-gray-300 hover:bg-indigo-500 hover:text-white'
-          }`}
+          className={`w-12 h-12 rounded-full flex items-center justify-center transition ${activeView === 'dms' && !selectedFriend
+            ? 'bg-indigo-600 text-white'
+            : 'bg-gray-700 text-gray-300 hover:bg-indigo-500 hover:text-white'
+            }`}
         >
           <Mail className="w-6 h-6" />
         </button>
@@ -465,11 +533,10 @@ function App() {
           <button
             key={server.id}
             onClick={() => setSelectedServer(server)}
-            className={`w-12 h-12 rounded-full flex items-center justify-center font-bold transition ${
-              selectedServer?.id === server.id
-                ? 'bg-indigo-600 text-white'
-                : 'bg-gray-700 text-gray-300 hover:bg-indigo-500 hover:text-white'
-            }`}
+            className={`w-12 h-12 rounded-full flex items-center justify-center font-bold transition ${selectedServer?.id === server.id
+              ? 'bg-indigo-600 text-white'
+              : 'bg-gray-700 text-gray-300 hover:bg-indigo-500 hover:text-white'
+              }`}
           >
             {server.name.substring(0, 2).toUpperCase()}
           </button>
@@ -543,11 +610,10 @@ function App() {
                   <button
                     key={friend.id}
                     onClick={() => openDMWithFriend(friend)}
-                    className={`w-full flex items-center px-2 py-2 rounded text-left transition ${
-                      selectedFriend?.id === friendId
-                        ? 'bg-gray-700 text-white'
-                        : 'text-gray-400 hover:bg-gray-700 hover:text-white'
-                    }`}
+                    className={`w-full flex items-center px-2 py-2 rounded text-left transition ${selectedFriend?.id === friendId
+                      ? 'bg-gray-700 text-white'
+                      : 'text-gray-400 hover:bg-gray-700 hover:text-white'
+                      }`}
                   >
                     <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-white text-sm font-bold mr-2">
                       {friendUsername.substring(0, 2).toUpperCase()}
@@ -577,11 +643,10 @@ function App() {
                 <button
                   key={channel.id}
                   onClick={() => setSelectedChannel(channel)}
-                  className={`w-full flex items-center px-2 py-1 rounded text-left transition ${
-                    selectedChannel?.id === channel.id
-                      ? 'bg-gray-700 text-white'
-                      : 'text-gray-400 hover:bg-gray-700 hover:text-white'
-                  }`}
+                  className={`w-full flex items-center px-2 py-1 rounded text-left transition ${selectedChannel?.id === channel.id
+                    ? 'bg-gray-700 text-white'
+                    : 'text-gray-400 hover:bg-gray-700 hover:text-white'
+                    }`}
                 >
                   <Hash className="w-4 h-4 mr-2" />
                   {channel.name}
